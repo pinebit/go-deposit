@@ -53,6 +53,12 @@ func main() {
 		log.Fatalf("Failed to read abi.json file: %v", err)
 	}
 
+	// Load the contract ABI
+	contractABI, err := abi.JSON(strings.NewReader(string(abiFile)))
+	if err != nil {
+		log.Fatalf("Failed to parse contract ABI: %v", err)
+	}
+
 	if len(os.Args) != 2 {
 		log.Fatalf("Usage: go-deposit <deposit_data.json>")
 	}
@@ -68,29 +74,6 @@ func main() {
 		log.Fatalf("Failed to connect to the Ethereum client: %v", err)
 	}
 
-	chainID, err := client.ChainID(context.Background())
-	if err != nil {
-		log.Fatalf("Failed to get chain ID: %v", err)
-	}
-	fmt.Printf("Chain ID: %d\n", chainID)
-
-	publicKey := privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-	if !ok {
-		log.Fatalf("Error casting public key to ECDSA")
-	}
-	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
-
-	nonce, err := client.PendingNonceAt(context.Background(), fromAddress)
-	if err != nil {
-		log.Fatalf("Failed to get nonce: %v", err)
-	}
-
-	gasPrice, err := client.SuggestGasPrice(context.Background())
-	if err != nil {
-		log.Fatalf("Failed to get gas price: %v", err)
-	}
-
 	file, err := os.ReadFile(depositDataFilePath)
 	if err != nil {
 		log.Fatalf("Failed to read deposit_data.json file: %v", err)
@@ -101,10 +84,43 @@ func main() {
 		log.Fatalf("Failed to unmarshal deposit data: %v", err)
 	}
 
-	// Use the first entry in the deposit data
-	data := depositData[0]
+	fmt.Printf("Deposit data has %d entries\n", len(depositData))
 
-	// Convert data to appropriate types
+	for _, data := range depositData {
+		submitSingleDepositData(data, contractABI, client, privateKey)
+	}
+}
+
+func submitSingleDepositData(data DepositData, abi abi.ABI, client *ethclient.Client, privateKey *ecdsa.PrivateKey) {
+	publicKey := privateKey.Public()
+	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+	if !ok {
+		log.Fatalf("Error casting public key to ECDSA")
+	}
+	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
+
+	chainID, err := client.ChainID(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to get chain ID: %v", err)
+	}
+	fmt.Printf("Chain ID: %d\n", chainID)
+
+	nonce, err := client.PendingNonceAt(context.Background(), fromAddress)
+	if err != nil {
+		log.Fatalf("Failed to get nonce: %v", err)
+	}
+
+	// Suggest gas fees for EIP-1559
+	tipCap, err := client.SuggestGasTipCap(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to get gas tip cap: %v", err)
+	}
+
+	feeCap, err := client.SuggestGasPrice(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to get gas fee cap: %v", err)
+	}
+
 	pubKeyBytes, err := hex.DecodeString(data.PubKey)
 	if err != nil {
 		log.Fatalf("Failed to decode pubkey: %v", err)
@@ -127,21 +143,27 @@ func main() {
 	var ddrArray [32]byte
 	copy(ddrArray[:], ddrBytes[:32])
 
-	// Load the contract ABI
-	contractABI, err := abi.JSON(strings.NewReader(string(abiFile)))
-	if err != nil {
-		log.Fatalf("Failed to parse contract ABI: %v", err)
-	}
-
 	// Pack the arguments
-	packedData, err := contractABI.Pack("deposit", pubKeyBytes, withdrawalCredentialsBytes, signatureBytes, ddrArray)
+	packedData, err := abi.Pack("deposit", pubKeyBytes, withdrawalCredentialsBytes, signatureBytes, ddrArray)
 	if err != nil {
 		log.Fatalf("Failed to pack arguments: %v", err)
 	}
 
 	// GWEI to WEI
 	amountWei := data.Amount.Mul(&data.Amount, big.NewInt(1e9))
-	tx := types.NewTransaction(nonce, common.HexToAddress(contractAddress), amountWei, uint64(gasLimit), gasPrice, packedData)
+
+	// Create EIP-1559 transaction
+	depositAddress := common.HexToAddress(contractAddress)
+	tx := types.NewTx(&types.DynamicFeeTx{
+		ChainID:   chainID,
+		Nonce:     nonce,
+		GasTipCap: tipCap,
+		GasFeeCap: feeCap,
+		Gas:       gasLimit,
+		To:        &depositAddress,
+		Value:     amountWei,
+		Data:      packedData,
+	})
 
 	txJS, err := json.MarshalIndent(tx, "", "  ")
 	if err != nil {
@@ -155,7 +177,8 @@ func main() {
 		log.Fatalf("Transaction cancelled")
 	}
 
-	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), privateKey)
+	signer := types.LatestSignerForChainID(chainID)
+	signedTx, err := types.SignTx(tx, signer, privateKey)
 	if err != nil {
 		log.Fatalf("Failed to sign transaction: %v", err)
 	}
